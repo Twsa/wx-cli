@@ -87,9 +87,14 @@ fn find_config_file() -> Result<PathBuf> {
 }
 
 pub fn cli_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join(".wx-cli")
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+    // 支持 sudo 环境：如果以 root 运行但有 SUDO_USER，切换到该用户的 home
+    let home = std::env::var("SUDO_USER")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(|u| PathBuf::from("/home").join(u))
+        .unwrap_or(home);
+    home.join(".wx-cli")
 }
 
 pub fn sock_path() -> PathBuf {
@@ -213,11 +218,30 @@ fn detect_db_dir_impl() -> Option<PathBuf> {
         }
     }
     candidates.sort_by_key(|p| {
-        std::fs::metadata(p)
-            .and_then(|m| m.modified())
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+        // 排序：取 db_storage 目录下所有 .db 文件的最新 mtime，而非目录自身的 mtime
+        // 这样当收到新消息时（只有 .db 文件被更新），能正确识别最新目录
+        latest_db_mtime(p).unwrap_or(std::time::SystemTime::UNIX_EPOCH)
     });
     candidates.into_iter().next_back()
+}
+
+/// 递归查找 db_storage 目录下所有 .db 文件的最新 mtime
+fn latest_db_mtime(dir: &Path) -> Option<std::time::SystemTime> {
+    let mut latest = None;
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let mtime = if path.is_dir() {
+                latest_db_mtime(&path).unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+            } else if path.extension().and_then(|s| s.to_str()) == Some("db") {
+                entry.metadata().and_then(|m| m.modified()).unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+            } else {
+                continue;
+            };
+            latest = Some(latest.map_or(mtime, |cur| if mtime > cur { mtime } else { cur }));
+        }
+    }
+    latest
 }
 
 #[cfg(target_os = "windows")]
